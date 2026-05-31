@@ -1,0 +1,8 @@
+work/
+.nextflow/
+.nextflow.log*
+results/
+*.2bit
+*.bb
+*.ix
+*.ixx
