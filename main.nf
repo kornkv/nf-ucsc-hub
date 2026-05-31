@@ -6,31 +6,44 @@
 
 nextflow.enable.dsl=2
 
-params.genome   = null
-params.gtf      = null
-params.trf      = null
-params.assembly = null
-params.outdir   = './hub'
-params.email    = 'your@email.cz'
+params.genome          = null
+params.gtf             = null
+params.trf             = null
+params.rmsk            = null
+params.assembly        = null
+params.organism        = 'unknown organism'
+params.scientific_name = null
+params.description     = null
+params.order_key       = 4800
+params.outdir          = './hub'
+params.email           = 'your@email.cz'
 
 if (!params.genome || !params.gtf || !params.trf) {
     error """
     Required parameters missing. Usage:
-      nextflow run main.nf --genome genome.fa --gtf genes.gtf --trf trf.dat --outdir ./hub
+      nextflow run main.nf --genome genome.fa --gtf genes.gtf --trf trf.dat [--rmsk rmsk.out] --outdir ./hub
     """.stripIndent()
 }
 
-def assembly = params.assembly ?: file(params.genome).baseName
+def assembly        = params.assembly ?: file(params.genome).baseName
+def organism        = params.organism
+def scientific_name = params.scientific_name ?: assembly
+def description     = params.description ?: "${assembly} genome assembly"
+def order_key       = params.order_key
 
 log.info """
     ========================
     nf-ucsc-hub
     ========================
-    genome   : ${params.genome}
-    gtf      : ${params.gtf}
-    trf      : ${params.trf}
-    assembly : ${assembly}
-    outdir   : ${params.outdir}
+    genome          : ${params.genome}
+    gtf             : ${params.gtf}
+    trf             : ${params.trf}
+    rmsk            : ${params.rmsk ?: 'not provided'}
+    assembly        : ${assembly}
+    organism        : ${organism}
+    scientific_name : ${scientific_name}
+    description     : ${description}
+    outdir          : ${params.outdir}
     ========================
 """.stripIndent()
 
@@ -71,7 +84,7 @@ process TRF_TO_BED {
 
     script:
     """
-    awk '/^Sequence:/{chr=\$2} NF>=15 && \$1~/^[0-9]+\$/{print chr, \$1-1, \$2}' OFS='\\t' ${dat} \
+    awk '/^Sequence:/{chr=\$2} NF>=15 && \$1~/^[0-9]+\$/{print chr, \$1-1, \$2}' OFS='\\t' ${dat} \\
         | sort -k1,1 -k2,2n > trf.sorted.bed
     """
 }
@@ -134,6 +147,27 @@ process SEARCH_INDEX {
     """
 }
 
+process RMSK_TRACKS {
+    input:
+    path rmsk_out
+    path sizes
+
+    output:
+    path "*.bb",              emit: bb_files
+    path "paste2trackdb.txt", emit: trackdb
+
+    script:
+    """
+    rmsk2bed.R --input ${rmsk_out} --prefix ${assembly} --outdir .
+
+    for bed in *.bed; do
+        sort -k1,1 -k2,2n \$bed > sorted.tmp
+        bedToBigBed -type=bed9 sorted.tmp ${sizes} \${bed%.bed}.bb
+        rm sorted.tmp
+    done
+    """
+}
+
 process ASSEMBLE_HUB {
     publishDir params.outdir, mode: 'copy'
 
@@ -144,31 +178,40 @@ process ASSEMBLE_HUB {
     path genes_bb
     path ix
     path ixx
+    path rmsk_bb
+    path rmsk_td
 
     output:
     path "**"
 
     script:
+    def has_rmsk = rmsk_td.name != 'NOFILE'
     """
     mkdir -p ${assembly}
 
     DEFPOS=\$(head -1 ${sizes} | awk '{print \$1":1-"(\$2<100000?\$2:100000)}')
 
-    cat > hub.txt << 'HUBEOF'
-hub ${assembly}
-shortLabel ${assembly}
-longLabel ${assembly} genome hub
-genomesFile genomes.txt
-email ${params.email}
-HUBEOF
-
-    cat > genomes.txt << GEOF
+    cat > add_this_to_genomes.txt << GEOF
 genome ${assembly}
 trackDb ${assembly}/trackDb.txt
+groups ${assembly}/groups.txt
+description ${description}
 twoBitPath ${assembly}/${assembly}.2bit
-organism ${assembly}
+organism ${organism}
 defaultPos \${DEFPOS}
+orderKey ${order_key}
+scientificName ${scientific_name}
+htmlPath ${assembly}/description.html
 GEOF
+
+    cat > ${assembly}/groups.txt << 'GRPEOF'
+name repeatMasker
+label Repeats & Masking
+priority 2
+defaultIsClosed 0
+GRPEOF
+
+    touch ${assembly}/description.html
 
     cat > ${assembly}/trackDb.txt << 'TEOF'
 track genes
@@ -187,6 +230,12 @@ longLabel Tandem Repeats
 type bigBed 3
 visibility dense
 TEOF
+
+    if [ "${has_rmsk}" = "true" ]; then
+        printf '\\n' >> ${assembly}/trackDb.txt
+        cat ${rmsk_td} >> ${assembly}/trackDb.txt
+        cp ${rmsk_bb} ${assembly}/
+    fi
 
     cp ${twobit} ${assembly}/
     cp ${trf_bb} ${assembly}/
@@ -213,12 +262,24 @@ workflow {
     GENES_TO_BIGBED(GTF_TO_BED.out.bed, CHROM_SIZES.out.sizes)
     SEARCH_INDEX(GTF_TO_BED.out.bed)
 
+    if (params.rmsk) {
+        rmsk_ch = Channel.fromPath(params.rmsk, checkIfExists: true)
+        RMSK_TRACKS(rmsk_ch, CHROM_SIZES.out.sizes)
+        rmsk_bb_ch = RMSK_TRACKS.out.bb_files.collect()
+        rmsk_td_ch = RMSK_TRACKS.out.trackdb
+    } else {
+        rmsk_bb_ch = Channel.fromPath("${projectDir}/assets/NOFILE")
+        rmsk_td_ch = Channel.fromPath("${projectDir}/assets/NOFILE")
+    }
+
     ASSEMBLE_HUB(
         MAKE_2BIT.out.twobit,
         CHROM_SIZES.out.sizes,
         TRF_TO_BIGBED.out.bb,
         GENES_TO_BIGBED.out.bb,
         SEARCH_INDEX.out.ix,
-        SEARCH_INDEX.out.ixx
+        SEARCH_INDEX.out.ixx,
+        rmsk_bb_ch,
+        rmsk_td_ch
     )
 }
